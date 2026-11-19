@@ -8,7 +8,10 @@ import {
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { ArtifactResourceScope } from "../../resources/index.js";
+import {
+  ArtifactResourceScope,
+  artifactPrimaryCleanupLeases,
+} from "../../resources/index.js";
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   AnalysisInputError,
@@ -82,6 +85,8 @@ const OPERATION = "inspect_desktop_application_state";
  * AnalysisCancelledError or ArtifactReaderFailure; cleanup failures retain their owner.
  */
 export interface DesktopStateReaders {
+  /** Command owner for staged inputs whose descriptor or directory cleanup failed. */
+  readonly resources?: ArtifactResourceScope;
   readonly sqlite: (
     database: string,
     signal?: AbortSignal,
@@ -221,6 +226,7 @@ const dconfGroups = (text: string, names: ReadonlySet<string>) => {
 const withStaged = async <Value>(
   files: readonly { readonly name: string; readonly bytes: Uint8Array }[],
   read: (paths: readonly string[]) => Promise<Value>,
+  resources = new ArtifactResourceScope(),
 ): Promise<Value> => {
   const root = await PrivateRuntimeRoot.create({
     prefix: "rea-desktop-state-",
@@ -239,11 +245,22 @@ const withStaged = async <Value>(
   } catch (cause: unknown) {
     outcome = { kind: "failed", cause };
   }
-  const resources = new ArtifactResourceScope();
+  const leases =
+    outcome.kind === "failed"
+      ? artifactPrimaryCleanupLeases(outcome.cause)
+      : [];
   const removed = await resources.release({
     kind: "private-runtime-root",
     resource: root.path,
-    root,
+    root: {
+      path: root.path,
+      close: async () => {
+        // Descriptor retirement precedes removal. Keep this dependency with the
+        // staged owner so a command close retries both, in the same order.
+        for (const lease of leases ?? []) await lease.release();
+        await root.close();
+      },
+    },
   });
   if (removed.kind === "failed")
     throw resources.cleanupFailure(outcome, [removed]);
@@ -313,26 +330,34 @@ const sqliteView = async (
     if (bytes.value !== undefined)
       staged.push({ name: `state.db${sidecar.suffix}`, bytes: bytes.value });
   }
-  return withStaged(staged, async ([database]) => {
-    const read = await context.readers.sqlite(
-      database ?? "",
-      context.signal,
-      context.policy,
-    );
-    return read.ok ? { view: read.view, error: null } : failed(read.error);
-  });
+  return withStaged(
+    staged,
+    async ([database]) => {
+      const read = await context.readers.sqlite(
+        database ?? "",
+        context.signal,
+        context.policy,
+      );
+      return read.ok ? { view: read.view, error: null } : failed(read.error);
+    },
+    context.readers.resources,
+  );
 };
 
 const dconfView = async (
   { bytes }: ReadInput,
   context: ViewContext,
 ): Promise<ViewOutcome> =>
-  withStaged([{ name: "user", bytes }], async ([database]) => {
-    const dump = await context.readers.dconf(database ?? "", context.signal);
-    return dump.ok
-      ? { view: dconfGroups(dump.text, context.names), error: null }
-      : failed(dump.error);
-  });
+  withStaged(
+    [{ name: "user", bytes }],
+    async ([database]) => {
+      const dump = await context.readers.dconf(database ?? "", context.signal);
+      return dump.ok
+        ? { view: dconfGroups(dump.text, context.names), error: null }
+        : failed(dump.error);
+    },
+    context.readers.resources,
+  );
 
 /** A reader's result as a version's view or view_error. */
 const outcomeOf = (read: Result<JsonValue, string>): ViewOutcome =>
