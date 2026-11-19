@@ -1,4 +1,4 @@
-import { lstat, opendir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, opendir, realpath, stat } from "node:fs/promises";
 import { extname, join, sep } from "node:path";
 
 import { z } from "zod";
@@ -6,6 +6,7 @@ import { z } from "zod";
 import { preflightPropertyListDecode } from "../domain/apple/propertyListDecodeBudget.js";
 import { decodeBinaryPropertyList } from "../domain/apple/binaryPlistMaterializer.js";
 import { BinaryTargetError } from "../domain/configurationErrors.js";
+import { decodeLimit, ParseFailureError } from "../domain/parseFailure.js";
 import { isPathWithinRoot } from "../domain/localPath.js";
 import { parseXmlPropertyList } from "../domain/propertyListKeys.js";
 import { decodeXmlPlistText } from "../domain/propertyListXmlText.js";
@@ -17,6 +18,31 @@ import type {
 import { openableAppleBundleExtension } from "../domain/apple/appleBundleTypes.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
+
+import {
+  bindRegularFileCleanup,
+  readRegularFile,
+} from "../process/RegularFileRead.js";
+
+/** Match the native plist inspector's input allowance, independent of decoding. */
+const BUNDLE_INFO_PLIST_INPUT_BYTES = 64 * 1024 * 1024;
+
+export const readBundleInfoPlist = (path: string): Promise<Buffer> =>
+  readRegularFile(path, {
+    symlinks: "follow",
+    admit: ({ size }) => {
+      if (size > BUNDLE_INFO_PLIST_INPUT_BYTES)
+        throw decodeLimit(
+          "plist",
+          `Info.plist exceeds the ${String(BUNDLE_INFO_PLIST_INPUT_BYTES)}-byte input allowance: ${path} (${String(size)} bytes)`,
+          {
+            name: "bundle Info.plist input bytes",
+            maximum: BUNDLE_INFO_PLIST_INPUT_BYTES,
+            required: size,
+          },
+        );
+    },
+  });
 
 /** Decoded representation bound for one binary Info.plist. */
 const BINARY_PLIST_DECODE_BYTES = 16 * 1024 * 1024;
@@ -84,7 +110,10 @@ interface AppBundleFileSystem {
   readonly realpath: (path: string) => Promise<string>;
 }
 
-const defaultFileSystem: AppBundleFileSystem = { readFile, realpath };
+const defaultFileSystem: AppBundleFileSystem = {
+  readFile: readBundleInfoPlist,
+  realpath,
+};
 
 /**
  * Resolve an app bundle directory to its declared program file. macOS and
@@ -427,17 +456,19 @@ const resolveLayoutExecutable = async (
   try {
     plist = await fileSystem.readFile(plistPath);
   } catch (cause: unknown) {
-    return err(
-      new BinaryTargetError(
-        plistPath,
-        isPermissionDenied(cause)
+    const error = new BinaryTargetError(
+      plistPath,
+      cause instanceof ParseFailureError && cause.kind === "limit"
+        ? cause.message
+        : isPermissionDenied(cause)
           ? `permission denied reading ${noun} Info.plist ${plistPath}`
           : isAbsence(cause)
             ? `${noun} Info.plist is missing: ${plistPath}`
             : `could not read ${noun} Info.plist ${plistPath}${codeDescription(cause)}`,
-        { cause },
-      ),
+      { cause },
     );
+    bindRegularFileCleanup(cause, error);
+    return err(error);
   }
 
   let name: string;
