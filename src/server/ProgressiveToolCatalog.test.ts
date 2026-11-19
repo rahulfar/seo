@@ -215,3 +215,54 @@ it.each([
     expect(f.changed).not.toHaveBeenCalled();
   },
 );
+
+it("ranks multi-word task queries by relevance instead of failing with zero matches (#11707)", async () => {
+  const f = await connect();
+
+  // 1. More matched words reverses alphabetical order:
+  // "inspection beta missing_token" matches beta_sqlite (2 words: beta in name, inspection in desc),
+  // but only 1 word for alpha_sqlite and binary_session (inspection in desc).
+  // beta_sqlite must rank before alpha_sqlite despite "beta" > "alpha" alphabetically.
+  const reverseAlphaResult = await f.discover({
+    query: "inspection beta missing_token",
+    limit: 10,
+  });
+  expect(reverseAlphaResult.isError).not.toBe(true);
+  const reverseToolNames = (
+    reverseAlphaResult.structuredContent as { tools: Array<{ name: string }> }
+  ).tools.map((t) => t.name);
+  expect(reverseToolNames).toEqual([
+    "beta_sqlite",
+    "alpha_sqlite",
+    "binary_session",
+  ]);
+
+  // 2. Equal word counts (1 hit each) settled by a name hit over description-only hit:
+  // "sqlite" matches 1 word in all 3 tools, but alpha_sqlite and beta_sqlite have name hits,
+  // while binary_session only has a description hit.
+  const nameHitResult = await f.discover({
+    query: "sqlite",
+    limit: 10,
+  });
+  expect(nameHitResult.isError).not.toBe(true);
+  const nameHitToolNames = (
+    nameHitResult.structuredContent as { tools: Array<{ name: string }> }
+  ).tools.map((t) => t.name);
+  expect(nameHitToolNames).toEqual([
+    "alpha_sqlite",
+    "beta_sqlite",
+    "binary_session",
+  ]);
+
+  // 3. When one tool matches all query words, it ranks strictly before partial matches:
+  const priorityResult = await f.discover({
+    query: "alpha sqlite inspection",
+    limit: 10,
+  });
+  expect(priorityResult.isError).not.toBe(true);
+  const priorityToolNames = (
+    priorityResult.structuredContent as { tools: Array<{ name: string }> }
+  ).tools.map((t) => t.name);
+  expect(priorityToolNames[0]).toBe("alpha_sqlite");
+  expect(priorityToolNames.slice(1)).toEqual(["beta_sqlite", "binary_session"]);
+});
