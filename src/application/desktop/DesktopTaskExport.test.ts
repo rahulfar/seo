@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../../tests/fixtures/temporaryDirectory.js";
+import { readExportedTaskChecks } from "../../../tests/fixtures/desktopTaskVerifier.js";
 import { AnalysisInputError } from "../../domain/analysisErrorCore.js";
 import { exportDesktopApplication } from "./DesktopApplicationExport.js";
 import { shippedSeedCheckView } from "./DesktopTaskExport.js";
@@ -394,14 +395,27 @@ describe("exportDesktopApplication with a task", () => {
     expect(await readFile(join(directory, "evals/notes.toml"), "utf8")).toBe(
       'tasks = ["note-milk"]\n',
     );
-    expect(
-      await readFile(
-        join(directory, "artifacts/note-milk-check/verify.py"),
-        "utf8",
-      ),
-    ).toContain(
-      '{"id": "milk", "kind": "lines_present", "file": "Documents/today.txt", "lines": ["milk"]},',
+    const verifier = await readFile(
+      join(directory, "artifacts/note-milk-check/verify.py"),
+      "utf8",
     );
+    expect(readExportedTaskChecks(verifier)).toEqual([
+      { id: "milk", kind: "lines_present", file: NOTE, lines: ["milk"] },
+      {
+        id: "check-2",
+        kind: "row_present",
+        file: DATABASE,
+        table: "notes",
+        where: { id: 2, body: "b" },
+      },
+      {
+        id: "check-3",
+        kind: "value_equals",
+        file: ".config/notes/settings.ini",
+        pointer: "/groups/ui/wrap",
+        value: "true",
+      },
+    ]);
     const readme = await readFile(join(directory, "README.md"), "utf8");
     expect(readme).toContain("## Task `note-milk`");
     expect(readme).toContain("> Write down that I need milk");
@@ -517,7 +531,15 @@ describe("exportDesktopApplication with a task's readers", () => {
       join(directory, "artifacts/note-milk-check/verify.py"),
       "utf8",
     );
-    expect(verifier).toContain('"reader": "version"');
+    expect(readExportedTaskChecks(verifier)).toEqual([
+      {
+        id: "version",
+        kind: "lines_present",
+        file: DATABASE,
+        reader: "version",
+        lines: ["version v2"],
+      },
+    ]);
     const readerLine = verifier.match(
       /^\s*(\{"id": "version", "arguments": .*\}),$/mu,
     );

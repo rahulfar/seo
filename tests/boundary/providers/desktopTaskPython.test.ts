@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
+import type { JsonValue } from "../../../src/domain/jsonValue.js";
 import type {
   DesktopTaskCheck,
   DesktopTaskReader,
@@ -242,7 +243,7 @@ const runVerifier = async (
   // same way even when the host's default pipe encoding differs.
   return JSON.parse(
     execFileSync(
-      "python3",
+      process.platform === "win32" ? "python" : "python3",
       ["-I", "-B", "-X", "utf8", "-c", DRIVER, folder, verifier],
       {
         input: JSON.stringify({
@@ -418,6 +419,230 @@ it.each([64, 350, 490])(
     expect(output.results.map(({ result }) => result)).toEqual([true]);
   },
 );
+
+it.each([32, 99, 100, 220, 350, 490])(
+  "grades nested JSON values at depth %i like REA",
+  async (depth) => {
+    const file = "Documents/deep.json";
+    let value: JsonValue = "leaf";
+    let different: JsonValue = "other";
+    for (let index = 0; index < depth; index++) {
+      value = [value];
+      different = [different];
+    }
+    const checks: DesktopTaskCheck[] = [
+      { id: "nested", kind: "value_equals", file, pointer: "/value", value },
+      {
+        id: "different",
+        kind: "value_equals",
+        file,
+        pointer: "/value",
+        value: different,
+      },
+    ];
+    const views = {
+      [file]: { format: "json" as const, view: { value }, truncated: false },
+    };
+    const expected = evaluateTaskChecks(checks, new Map(Object.entries(views)));
+    expect(expected.map(({ passed }) => passed)).toEqual([true, false]);
+    const output = await runVerifier(checks, [[0, views]], [], {
+      exec: false,
+      fileContents: { [file]: JSON.stringify({ value }) },
+    });
+    expect(output.results.map(({ result }) => result)).toEqual([true, false]);
+    expect(output.results.map(({ description }) => description)).toEqual(
+      expected.map(({ description }) => description),
+    );
+  },
+);
+
+it("retains sibling JSON values and special keys in a deep check", async () => {
+  const file = "Documents/siblings.json";
+  const nest = (depth: number, leaf: JsonValue): JsonValue => {
+    let value = leaf;
+    for (let index = 0; index < depth; index++)
+      value = index % 2 === 0 ? [value] : { item: value };
+    return value;
+  };
+  const value: Record<string, JsonValue> = JSON.parse(
+    '{"__proto__":"plain","flag":true,"count":0}',
+  );
+  value.left = nest(220, "left");
+  value.right = nest(230, "right");
+  const different = { ...value, right: nest(230, "other") };
+  const checks: DesktopTaskCheck[] = [
+    { id: "same", kind: "value_equals", file, pointer: "/value", value },
+    {
+      id: "different",
+      kind: "value_equals",
+      file,
+      pointer: "/value",
+      value: different,
+    },
+  ];
+  const views = {
+    [file]: { format: "json" as const, view: { value }, truncated: false },
+  };
+  const expected = evaluateTaskChecks(checks, new Map(Object.entries(views)));
+  expect(expected.map(({ passed }) => passed)).toEqual([true, false]);
+  const output = await runVerifier(checks, [[0, views]], [], {
+    exec: false,
+    fileContents: { [file]: JSON.stringify({ value }) },
+  });
+  expect(output.results.map(({ result }) => result)).toEqual([true, false]);
+  expect(output.results.map(({ description }) => description)).toEqual(
+    expected.map(({ description }) => description),
+  );
+});
+
+it("compares and describes a near-limit JSON value without recursive Python calls", async () => {
+  const file = "Documents/deep.json";
+  let value: JsonValue = "leaf";
+  let different: JsonValue = "other";
+  for (let index = 0; index < 989; index++) {
+    value = [value];
+    different = [different];
+  }
+  const checks: DesktopTaskCheck[] = [
+    { id: "equal", kind: "value_equals", file, pointer: "/value", value },
+    {
+      id: "different",
+      kind: "value_equals",
+      file,
+      pointer: "/value",
+      value: different,
+    },
+    { id: "absent", kind: "value_absent", file, pointer: "/value" },
+  ];
+  const views = {
+    [file]: { format: "json" as const, view: { value }, truncated: false },
+  };
+  const expected = evaluateTaskChecks(checks, new Map(Object.entries(views)));
+  expect(expected.map(({ passed }) => passed)).toEqual([true, false, false]);
+
+  const folder = await createTestTempDirectory("desktop-task-deep-json-");
+  await mkdir(join(folder, "agentenv_protocol"));
+  await writeFile(join(folder, "agentenv_protocol/__init__.py"), "");
+  await writeFile(join(folder, "agentenv_protocol/client.py"), STUB_CLIENT);
+  await writeFile(
+    join(folder, "agentenv_protocol/types.py"),
+    'RPC_PATH = "/agentenv"\n',
+  );
+  const verifier = join(folder, "verify.py");
+  await writeFile(
+    verifier,
+    renderTaskVerifier({ name: "deep", prompt: "Edit.", checks }, "notes"),
+  );
+  const driver = String.raw`
+import importlib.util, json, sys
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location("verifier", sys.argv[2])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+value = "leaf"
+for _ in range(989):
+    value = [value]
+views = {"Documents/deep.json": {"format":"json", "view":{"value":value}, "truncated":False}}
+print(json.dumps(module.evaluate(module.CHECKS, views)))
+`;
+  const result = JSON.parse(
+    execFileSync(
+      process.platform === "win32" ? "python" : "python3",
+      ["-I", "-B", "-X", "utf8", "-c", driver, folder, verifier],
+      {
+        encoding: "utf8",
+      },
+    ),
+  ) as VerifierOutput["results"];
+  expect(result.map(({ result }) => result)).toEqual([true, false, false]);
+  expect(result.map(({ description }) => description)).toEqual(
+    expected.map(({ description }) => description),
+  );
+});
+
+it("grades a near-limit JSON value through the async verifier", async () => {
+  const file = "Documents/deep.json";
+  let value: JsonValue = "leaf";
+  let different: JsonValue = "other";
+  for (let index = 0; index < 989; index++) {
+    value = [value];
+    different = [different];
+  }
+  const checks: DesktopTaskCheck[] = [
+    { id: "equal", kind: "value_equals", file, pointer: "/value", value },
+    {
+      id: "different",
+      kind: "value_equals",
+      file,
+      pointer: "/value",
+      value: different,
+    },
+    { id: "absent", kind: "value_absent", file, pointer: "/value" },
+  ];
+  const views = {
+    [file]: { format: "json" as const, view: { value }, truncated: false },
+  };
+  const expected = evaluateTaskChecks(checks, new Map(Object.entries(views)));
+  expect(expected.map(({ passed }) => passed)).toEqual([true, false, false]);
+
+  const folder = await createTestTempDirectory("desktop-task-deep-async-");
+  await mkdir(join(folder, "agentenv_protocol"));
+  await writeFile(join(folder, "agentenv_protocol/__init__.py"), "");
+  await writeFile(join(folder, "agentenv_protocol/client.py"), STUB_CLIENT);
+  await writeFile(
+    join(folder, "agentenv_protocol/types.py"),
+    'RPC_PATH = "/agentenv"\n',
+  );
+  const verifier = join(folder, "verify.py");
+  await writeFile(
+    verifier,
+    renderTaskVerifier({ name: "deep", prompt: "Edit.", checks }, "notes"),
+  );
+  // Construct the view inside Python: this exercises the verifier's real async
+  // call stack without relying on a separate JSON transport's depth limit.
+  const driver = String.raw`
+import asyncio, importlib.util, json, sys, types
+sys.path.insert(0, sys.argv[1])
+from agentenv_protocol import client
+spec = importlib.util.spec_from_file_location("verifier", sys.argv[2])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+value = "leaf"
+for _ in range(989):
+    value = [value]
+views = {"Documents/deep.json": {"format":"json", "view":{"value":value}, "truncated":False}}
+clock = [0.0]
+async def get_card(url, **_):
+    return {"children_environments":[{"name":"notes", "url":"/svc/notes/agentenv"}]}
+async def get_data(url, **_):
+    clock[0] += 0.125
+    return types.SimpleNamespace(parts=[types.SimpleNamespace(kind="data", data={"state":views})])
+async def sleep(seconds):
+    clock[0] += seconds
+async def wait_for(awaitable, timeout):
+    return await awaitable
+client.get_card, client.get_data = get_card, get_data
+module.time = types.SimpleNamespace(monotonic=lambda: clock[0])
+module.asyncio = types.SimpleNamespace(sleep=sleep, wait_for=wait_for, TimeoutError=asyncio.TimeoutError)
+print(json.dumps(asyncio.run(module.verify("http://mcp", "http://computer"))))
+`;
+  const result = JSON.parse(
+    execFileSync(
+      process.platform === "win32" ? "python" : "python3",
+      ["-I", "-B", "-X", "utf8", "-c", driver, folder, verifier],
+      { encoding: "utf8" },
+    ),
+  ) as VerifierOutput["results"];
+  expect(result.map(({ result }) => result)).toEqual([true, false, false]);
+  expect(result.map(({ description }) => description)).toEqual(
+    expected.map(({ description }) => description),
+  );
+  expect(result.map(({ settled, read_cut }) => [settled, read_cut])).toEqual([
+    [true, false],
+    [true, false],
+    [true, false],
+  ]);
+});
 
 it("decodes JSON pointer escapes once in the exported verifier", async () => {
   const checks: DesktopTaskCheck[] = [

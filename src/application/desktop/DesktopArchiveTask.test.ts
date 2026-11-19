@@ -5,6 +5,7 @@ import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../../tests/fixtures/temporaryDirectory.js";
+import { readExportedTaskChecks } from "../../../tests/fixtures/desktopTaskVerifier.js";
 import type { DesktopApplicationCapture } from "../../domain/desktop/desktopCapture.js";
 import { desktopApplicationStateSchema } from "../../domain/desktop/desktopState.js";
 import {
@@ -256,8 +257,10 @@ describe("documents saved as zip archives", () => {
       join(directory, "artifacts/cut-hole-check/verify.py"),
       "utf8",
     );
-    expect(verifier).toContain(`"tolerance": 0.01`);
-    expect(verifier).toContain(JSON.stringify(milk.pointer));
+    expect(readExportedTaskChecks(verifier)).toEqual([
+      { ...HOLE, id: "check-1" },
+      { ...milk, id: "check-2" },
+    ]);
   });
 
   it("accepts a check on the whole listing, whose value holds namespaced XML", async () => {
